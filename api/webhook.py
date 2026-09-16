@@ -3,6 +3,8 @@
 Bu fayl bitta o'zida quyidagilarni o'z ichiga oladi:
     * O'zbek lotin<->kirill konvertatsiya mantig'i (converter.py bilan bir xil).
     * Telegram webhook so'rovlarini qabul qiluvchi HTTP handler.
+    * PDF, DOCX va TXT fayllardan matn ajratib olish va natijani fayl
+      sifatida qaytarish.
 
 Arxitektura tanlovi: bu bot HOLATSIZ (stateless) ishlaydi — foydalanuvchi
 tanlagan "rejim" saqlanmaydi, chunki serverless funksiyalar har safar yangi
@@ -15,16 +17,30 @@ holatni saqlash) keraksiz murakkablik qo'shган bo'lardi.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
-import urllib.request
 from http.server import BaseHTTPRequestHandler
+
+import requests
+from pypdf import PdfReader
+from docx import Document
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
 MAX_CHUNK_LENGTH = 3800
+
+#: Telegram bot API orqali yuklab olish mumkin bo'lgan maksimal fayl hajmi
+#: (Telegram'ning o'zi 20 MB dan katta fayllarni bot orqali yuklashga
+#: ruxsat bermaydi; biz xavfsizlik uchun bir oz kichikroq chegara qo'yamiz).
+MAX_FILE_SIZE_BYTES = 18 * 1024 * 1024
+
+#: Qo'llab-quvvatlanadigan fayl kengaytmalari.
+SUPPORTED_EXTENSIONS = (".txt", ".pdf", ".docx")
+
 
 # ---------------------------------------------------------------------------
 # Konvertatsiya mantig'i (converter.py bilan bir xil)
@@ -191,21 +207,46 @@ WELCOME_TEXT = (
     "avtomatik aylantiruvchi botman.\n\n"
     "Menga istalgan matnni yuboring — lotinchami yoki kirillchami, o'zim "
     "aniqlab, qarama-qarshi yozuvga o'tkazib beraman.\n\n"
+    "📎 Fayl ham yuborishingiz mumkin: *.txt*, *.pdf*, *.docx* — men ichidagi "
+    "matnni o'qib, konvertatsiya qilib, tayyor faylni qaytaraman.\n\n"
     "🌐 Veb-saytimiz ham bor: https://mwukurulloh-max.github.io/ikki-alifbo/\n\n"
     "Yordam uchun /help yuboring."
 )
 
 HELP_TEXT = (
     "*Bot qanday ishlaydi:*\n\n"
-    "Menga istalgan matnni yuboring. Men uni avtomatik ravishda:\n"
-    "• lotincha bo'lsa — kirillchaga,\n"
-    "• kirillcha bo'lsa — lotinchaga aylantirib beraman.\n\n"
+    "1️⃣ Menga matn yuboring — avtomatik ravishda lotin↔kirill aylantirib beraman.\n\n"
+    "2️⃣ Yoki fayl yuboring (*.txt*, *.pdf*, *.docx*) — men ichidagi matnni "
+    "o'qib, konvertatsiya qilib, *natija.txt* fayli sifatida qaytaraman.\n\n"
     "Raqamlar, tinish belgilari, emoji va boshqa til so'zlari o'zgarishsiz "
     "qoladi.\n\n"
+    "*Fayllar bo'yicha eslatmalar:*\n"
+    "• Eski *.doc* formati (Word 2003) qo'llab-quvvatlanmaydi — avval "
+    "*.docx*ga saqlang.\n"
+    "• Skanerlangan (rasm sifatidagi) PDF fayllardan matn chiqarib bo'lmaydi.\n"
+    "• Fayl hajmi 18 MB dan oshmasligi kerak.\n\n"
     "🌐 Veb-saytimiz: https://mwukurulloh-max.github.io/ikki-alifbo/"
 )
 
 EMPTY_TEXT_WARNING = "Matn bo'sh ko'rinadi. Iltimos, konvertatsiya qilish uchun biror matn yuboring."
+UNSUPPORTED_FORMAT_WARNING = (
+    "Bu fayl formatini o'qiy olmayman. Faqat *.txt*, *.pdf* va *.docx* "
+    "fayllarni qo'llab-quvvatlayman."
+)
+OLD_DOC_WARNING = (
+    "Eski *.doc* formati (Word 2003 va undan oldingi) qo'llab-quvvatlanmaydi. "
+    "Iltimos, faylni Word orqali *.docx* formatida qayta saqlang, yoki "
+    "matnni to'g'ridan-to'g'ri menga yuboring."
+)
+FILE_TOO_LARGE_WARNING = "Fayl juda katta (18 MB dan oshmasligi kerak). Kichikroq fayl bilan urinib ko'ring."
+NO_TEXT_IN_FILE_WARNING = (
+    "Fayldan matn topa olmadim. Fayl bo'sh yoki faqat rasmlardan iborat "
+    "(skanerlangan) bo'lishi mumkin."
+)
+FILE_PROCESSING_ERROR = (
+    "Kechirasiz, faylni qayta ishlashda xatolik yuz berdi. Iltimos, faylni "
+    "tekshirib, qaytadan urinib ko'ring."
+)
 
 
 def send_message(chat_id: int, text: str) -> None:
@@ -216,31 +257,123 @@ def send_message(chat_id: int, text: str) -> None:
     chunks = [text[i:i + MAX_CHUNK_LENGTH] for i in range(0, len(text), MAX_CHUNK_LENGTH)] or [text]
 
     for chunk in chunks:
-        payload = json.dumps({
-            "chat_id": chat_id,
-            "text": chunk,
-            "parse_mode": "Markdown",
-        }).encode("utf-8")
-        request = urllib.request.Request(
-            f"{TELEGRAM_API}/sendMessage",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
         try:
-            urllib.request.urlopen(request, timeout=10)
+            resp = requests.post(
+                f"{TELEGRAM_API}/sendMessage",
+                json={"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"},
+                timeout=10,
+            )
+            if not resp.ok:
+                raise ValueError("Markdown bilan yuborib bo'lmadi")
         except Exception:
             # Markdown parse xatosi bo'lishi mumkin (masalan maxsus belgilar) —
             # oddiy matn sifatida qayta yuborib ko'ramiz.
-            plain_payload = json.dumps({"chat_id": chat_id, "text": chunk}).encode("utf-8")
-            plain_request = urllib.request.Request(
-                f"{TELEGRAM_API}/sendMessage",
-                data=plain_payload,
-                headers={"Content-Type": "application/json"},
-            )
             try:
-                urllib.request.urlopen(plain_request, timeout=10)
+                requests.post(
+                    f"{TELEGRAM_API}/sendMessage",
+                    json={"chat_id": chat_id, "text": chunk},
+                    timeout=10,
+                )
             except Exception:
                 pass
+
+
+def send_document(chat_id: int, filename: str, content: bytes, caption: str = "") -> None:
+    """Telegram Bot API orqali fayl (masalan natija.txt) yuboradi."""
+    try:
+        requests.post(
+            f"{TELEGRAM_API}/sendDocument",
+            data={"chat_id": chat_id, "caption": caption[:1000]},
+            files={"document": (filename, content, "text/plain")},
+            timeout=20,
+        )
+    except Exception:
+        send_message(chat_id, "Natija faylini yuborib bo'lmadi. Iltimos, qaytadan urinib ko'ring.")
+
+
+def download_telegram_file(file_id: str) -> bytes | None:
+    """Telegram'ga yuklangan faylni ikki bosqichda (getFile + yuklab olish) oladi."""
+    file_info = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=15)
+    file_info.raise_for_status()
+    file_path = file_info.json()["result"]["file_path"]
+    file_resp = requests.get(f"{TELEGRAM_FILE_API}/{file_path}", timeout=30)
+    file_resp.raise_for_status()
+    return file_resp.content
+
+
+def extract_text_from_txt(data: bytes) -> str:
+    """TXT fayldan matnni turli kodlashlarni sinab o'qiydi."""
+    for encoding in ("utf-8-sig", "utf-8", "cp1251", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def extract_text_from_pdf(data: bytes) -> str:
+    """PDF fayldagi barcha sahifalardan matnni ajratib oladi."""
+    reader = PdfReader(io.BytesIO(data))
+    pages_text = []
+    for page in reader.pages:
+        pages_text.append(page.extract_text() or "")
+    return "\n\n".join(pages_text).strip()
+
+
+def extract_text_from_docx(data: bytes) -> str:
+    """DOCX fayldagi paragraflardan matnni ajratib oladi."""
+    document = Document(io.BytesIO(data))
+    paragraphs = [p.text for p in document.paragraphs]
+    return "\n".join(paragraphs).strip()
+
+
+def handle_document(chat_id: int, document: dict) -> None:
+    """Yuborilgan faylni yuklab oladi, matnini konvertatsiya qilib, natijani qaytaradi."""
+    file_name = document.get("file_name") or "fayl"
+    file_size = document.get("file_size") or 0
+    file_id = document.get("file_id")
+
+    if file_size and file_size > MAX_FILE_SIZE_BYTES:
+        send_message(chat_id, FILE_TOO_LARGE_WARNING)
+        return
+
+    lower_name = file_name.lower()
+    ext = "." + lower_name.rsplit(".", 1)[-1] if "." in lower_name else ""
+
+    if ext == ".doc":
+        send_message(chat_id, OLD_DOC_WARNING)
+        return
+
+    if ext not in SUPPORTED_EXTENSIONS:
+        send_message(chat_id, UNSUPPORTED_FORMAT_WARNING)
+        return
+
+    try:
+        data = download_telegram_file(file_id)
+    except Exception:
+        send_message(chat_id, FILE_PROCESSING_ERROR)
+        return
+
+    try:
+        if ext == ".txt":
+            text = extract_text_from_txt(data)
+        elif ext == ".pdf":
+            text = extract_text_from_pdf(data)
+        elif ext == ".docx":
+            text = extract_text_from_docx(data)
+        else:
+            text = ""
+    except Exception:
+        send_message(chat_id, FILE_PROCESSING_ERROR)
+        return
+
+    if not text or not text.strip():
+        send_message(chat_id, NO_TEXT_IN_FILE_WARNING)
+        return
+
+    result = auto_convert(text)
+    preview = result[:180] + ("…" if len(result) > 180 else "")
+    send_document(chat_id, "natija.txt", result.encode("utf-8"), caption=f"✅ Tayyor!\n\n{preview}")
 
 
 class handler(BaseHTTPRequestHandler):
@@ -263,17 +396,21 @@ class handler(BaseHTTPRequestHandler):
             message = update.get("message") or update.get("edited_message")
             if message:
                 chat_id = message["chat"]["id"]
-                text = (message.get("text") or "").strip()
+                document = message.get("document")
 
-                if text == "/start":
-                    send_message(chat_id, WELCOME_TEXT)
-                elif text == "/help":
-                    send_message(chat_id, HELP_TEXT)
-                elif text:
-                    result = auto_convert(text)
-                    send_message(chat_id, result)
+                if document:
+                    handle_document(chat_id, document)
                 else:
-                    send_message(chat_id, EMPTY_TEXT_WARNING)
+                    text = (message.get("text") or "").strip()
+                    if text == "/start":
+                        send_message(chat_id, WELCOME_TEXT)
+                    elif text == "/help":
+                        send_message(chat_id, HELP_TEXT)
+                    elif text:
+                        result = auto_convert(text)
+                        send_message(chat_id, result)
+                    else:
+                        send_message(chat_id, EMPTY_TEXT_WARNING)
         except Exception:
             # Bot hech qachon qulab tushmasligi kerak — xato bo'lsa ham
             # Telegram'ga 200 OK qaytaramiz, aks holda Telegram qayta-qayta
